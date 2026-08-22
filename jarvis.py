@@ -3,7 +3,6 @@ import re
 import time
 import tempfile
 import wave
-import winsound
 from piper import PiperVoice
 from datetime import datetime
 
@@ -18,6 +17,8 @@ from faster_whisper import WhisperModel
 import requests
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+
+from visualizer import Visualizer
 
 
 # ============================================================
@@ -56,6 +57,26 @@ SPOTIFY_SCOPES = (
     "playlist-read-private "
     "playlist-read-collaborative"
 )
+
+# Corner for the waveform pop-up: "top-left" | "top-right" | "bottom-left" | "bottom-right"
+VISUALIZER_CORNER = "top-left"
+
+# Phrases that end a conversation session and return to wake-word listening.
+# Apostrophes are stripped before matching, so "that's all" and "thats all"
+# both match.
+END_PHRASES = [
+    "thats all jarvis",
+    "thats all for now",
+    "thats all",
+    "goodbye",
+    "stop listening",
+    "im done",
+    "thats it jarvis",
+]
+
+# How many consecutive silent/empty turns before Jarvis gives up and
+# goes back to sleep on its own (in case you walk away mid-conversation).
+MAX_CONSECUTIVE_SILENCES = 2
 
 
 # ============================================================
@@ -116,7 +137,6 @@ if spotify_client_id and spotify_client_secret:
 
         spotify_client = spotipy.Spotify(auth_manager=spotify_auth)
 
-        # Trigger auth flow now (opens browser once, then caches token)
         spotify_client.current_user()
 
         print("Spotify ready.")
@@ -133,12 +153,52 @@ else:
         "Spotify commands will not work until these are set."
     )
 
+print("Starting waveform pop-up...")
+viz = Visualizer(corner=VISUALIZER_CORNER)
+viz.start()
+print("Waveform pop-up ready.")
+
+pa = pyaudio.PyAudio()
+
 
 # ============================================================
 # TEXT TO SPEECH
 # ============================================================
 
+def _play_wav_with_levels(path):
+
+    wf = wave.open(path, "rb")
+
+    stream = pa.open(
+        format=pa.get_format_from_width(wf.getsampwidth()),
+        channels=wf.getnchannels(),
+        rate=wf.getframerate(),
+        output=True
+    )
+
+    chunk_size = 1024
+    data = wf.readframes(chunk_size)
+
+    while data:
+
+        stream.write(data)
+
+        samples = np.frombuffer(data, dtype=np.int16)
+
+        if len(samples) > 0:
+            rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2)) / 32768
+            viz.push_level(rms * 3)
+
+        data = wf.readframes(chunk_size)
+
+    stream.stop_stream()
+    stream.close()
+    wf.close()
+
+
 def speak(text):
+
+    viz.set_state("speaking")
 
     print(f"Jarvis: {text}")
 
@@ -158,15 +218,14 @@ def speak(text):
                 wav_file
             )
 
-        winsound.PlaySound(
-            output_file,
-            winsound.SND_FILENAME
-        )
+        _play_wav_with_levels(output_file)
 
     finally:
 
         if os.path.exists(output_file):
             os.remove(output_file)
+
+        viz.set_state("idle")
 
 
 # ============================================================
@@ -175,47 +234,64 @@ def speak(text):
 
 def listen_for_question():
 
+    viz.set_state("listening")
+
     print()
-    print("🎤 Listening for your question...")
+    print("🎤 Listening...")
 
     duration = 5
+    frames = []
 
-    audio = sd.rec(
-        int(duration * RATE),
-        samplerate=RATE,
-        channels=1,
-        dtype="int16"
-    )
+    def callback(indata, frame_count, time_info, status):
 
-    sd.wait()
+        frames.append(indata.copy())
 
-    filename = "question.wav"
+        rms = np.sqrt(np.mean(indata.astype(np.float64) ** 2)) / 32768
+        viz.push_level(rms * 4)
 
-    write(
-        filename,
-        RATE,
-        audio
-    )
+    try:
 
-    print("Processing...")
+        with sd.InputStream(
+            samplerate=RATE,
+            channels=1,
+            dtype="int16",
+            callback=callback
+        ):
+            sd.sleep(int(duration * 1000))
 
-    segments, info = whisper.transcribe(
-        filename,
-        beam_size=5
-    )
+        audio_data = np.concatenate(frames, axis=0)
 
-    text = ""
+        filename = "question.wav"
 
-    for segment in segments:
-        text += segment.text
+        write(
+            filename,
+            RATE,
+            audio_data
+        )
 
-    text = text.strip()
+        print("Processing...")
 
-    os.remove(filename)
+        segments, info = whisper.transcribe(
+            filename,
+            beam_size=5
+        )
 
-    print(f"You: {text}")
+        text = ""
 
-    return text.lower()
+        for segment in segments:
+            text += segment.text
+
+        text = text.strip()
+
+        os.remove(filename)
+
+        print(f"You: {text}")
+
+        return text.lower()
+
+    finally:
+
+        viz.set_state("idle")
 
 
 # ============================================================
@@ -233,7 +309,6 @@ def ask_ollama(question):
         {"role": "user", "content": question}
     )
 
-    # Trim history so the request doesn't grow forever
     max_messages = MAX_HISTORY_TURNS * 2
     if len(conversation_history) > max_messages:
         conversation_history = conversation_history[-max_messages:]
@@ -271,7 +346,6 @@ def ask_ollama(question):
 
         print(f"Ollama error: {e}")
 
-        # Drop the failed user turn so it doesn't poison history
         if conversation_history and conversation_history[-1]["role"] == "user":
             conversation_history.pop()
 
@@ -283,11 +357,6 @@ def ask_ollama(question):
 # ============================================================
 
 def find_playlist_by_name(query):
-    """
-    Search the user's own playlists for the best name match against `query`.
-    Simple approach: fetch all playlists, score by how many query words
-    appear in the playlist name, return the best match.
-    """
 
     results = spotify_client.current_user_playlists(limit=50)
     playlists = results["items"]
@@ -326,7 +395,6 @@ def get_active_device_id():
         if device["is_active"]:
             return device["id"]
 
-    # No active device — fall back to the first available one
     if devices["devices"]:
         return devices["devices"][0]["id"]
 
@@ -334,11 +402,6 @@ def get_active_device_id():
 
 
 def wait_for_device(timeout=15, interval=1.0):
-    """
-    Poll Spotify for an available device until one shows up or timeout
-    is reached. Right after launching the app, it can take a few seconds
-    to register as a playback device.
-    """
 
     waited = 0.0
 
@@ -356,11 +419,6 @@ def wait_for_device(timeout=15, interval=1.0):
 
 
 def start_playback_with_retry(playlist_uri, attempts=3):
-    """
-    Device IDs can go stale between fetching the device list and issuing
-    play, especially right after the app opens. Re-fetch the device and
-    retry a couple of times on 404 before giving up.
-    """
 
     last_error = None
 
@@ -398,7 +456,6 @@ def play_playlist(query):
     if not spotify_client:
         return "Spotify isn't set up yet, sir. I don't have API credentials."
 
-    # Make sure the desktop app is open so there's a device to play on
     os.startfile("spotify:")
 
     playlist = find_playlist_by_name(query)
@@ -420,10 +477,6 @@ def play_playlist(query):
 
 
 def extract_playlist_query(command):
-    """
-    Pull the playlist name/keywords out of a command like
-    'play my british playlist' -> 'british'
-    """
 
     text = command
 
@@ -437,10 +490,34 @@ def extract_playlist_query(command):
 
 
 # ============================================================
+# CONVERSATION CONTROL
+# ============================================================
+
+def is_end_phrase(command):
+
+    normalized = command.replace("'", "")
+
+    return any(marker in normalized for marker in END_PHRASES)
+
+
+# ============================================================
 # PROCESS COMMAND
 # ============================================================
 
 def process_command(command):
+    """
+    Handles one turn of the conversation.
+    Returns True to keep the conversation going, False to end it and
+    go back to waiting for the wake word.
+    """
+
+    if is_end_phrase(command):
+
+        speak(
+            "Alright, sir. Just say Hey Jarvis whenever you need me again."
+        )
+
+        return False
 
     if "what time" in command or "time is it" in command:
 
@@ -450,7 +527,7 @@ def process_command(command):
             f"It is {current_time}, sir."
         )
 
-        return
+        return True
 
     if "clear history" in command or "forget everything" in command:
 
@@ -460,15 +537,7 @@ def process_command(command):
             "Conversation history cleared, sir."
         )
 
-        return
-
-    if "goodbye" in command or "stop listening" in command:
-
-        speak(
-            "Goodbye, sir."
-        )
-
-        return
+        return True
 
     if "play" in command and ("playlist" in command or "spotify" in command):
 
@@ -482,21 +551,20 @@ def process_command(command):
 
         speak(result)
 
-        return
+        return True
 
-    # Anything else goes to the local model
     answer = ask_ollama(command)
 
     speak(answer)
+
+    return True
 
 
 # ============================================================
 # MICROPHONE
 # ============================================================
 
-audio = pyaudio.PyAudio()
-
-stream = audio.open(
+stream = pa.open(
     format=pyaudio.paInt16,
     channels=1,
     rate=RATE,
@@ -550,11 +618,34 @@ try:
                     "Yes, how can I help you, sir?"
                 )
 
-                # Listen for the question
-                command = listen_for_question()
+                # Conversation loop: keep going until an end phrase,
+                # or a couple of silent turns in a row.
+                consecutive_silences = 0
 
-                if command:
-                    process_command(command)
+                while True:
+
+                    command = listen_for_question()
+
+                    if not command:
+
+                        consecutive_silences += 1
+
+                        if consecutive_silences >= MAX_CONSECUTIVE_SILENCES:
+
+                            speak(
+                                "I didn't catch anything, sir. Say Hey Jarvis when you're ready."
+                            )
+
+                            break
+
+                        continue
+
+                    consecutive_silences = 0
+
+                    keep_going = process_command(command)
+
+                    if not keep_going:
+                        break
 
                 wake_model.reset()
 
@@ -573,4 +664,4 @@ finally:
 
     stream.stop_stream()
     stream.close()
-    audio.terminate()
+    pa.terminate()
